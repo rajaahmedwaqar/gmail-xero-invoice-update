@@ -1,0 +1,719 @@
+{
+  "id": "gmailXeroBills",
+  "name": "Gmail -> Xero Draft Bills",
+  "nodes": [
+    {
+      "id": "node-01",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyX",
+              "value": 5,
+              "unit": "minutes"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "label:Invoices has:attachment filename:pdf",
+          "readStatus": "both"
+        },
+        "options": {
+          "downloadAttachments": true
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "",
+          "name": "Gmail OAuth2"
+        }
+      }
+    },
+    {
+      "id": "node-02",
+      "name": "Prepare Invoices",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Intake in one step: keep only PDF attachments, drop ones already turned into a Bill,\n// and build the Gemini request. An email with no PDF emits nothing, which ends the run here.\nconst GEMINI_MODEL = 'gemini-3.5-flash';\n\nconst SYSTEM_PROMPT = [\n  'You extract structured data from vendor invoices (bills the user RECEIVES and must pay).',\n  'The document may be a text PDF or a scanned/image-only PDF; read it visually if needed.',\n  'Return STRICT JSON only, matching the response schema. No markdown, no commentary.',\n  'Rules:',\n  '- vendor_name is the party ISSUING the invoice (the supplier), not the customer being billed.',\n  '- Use null for any field that is not printed on the invoice. NEVER guess or invent dates, amounts, emails or numbers.',\n  '- Dates must be YYYY-MM-DD. If a date is ambiguous or absent, use null.',\n  '- Amounts are plain numbers: no currency symbols or thousands separators.',\n  '- One line_items entry per invoiced line. If there is no quantity column, use quantity 1.',\n  '- subtotal is the pre-tax total, tax_amount the total tax, total_payable the final amount due.',\n  '- payment_method is as stated on the invoice (e.g. \"COD\", \"Bank transfer\"), else null.',\n].join('\\n');\n\nconst nullable = (type) => ({ type, nullable: true });\n\nconst RESPONSE_SCHEMA = {\n  type: 'OBJECT',\n  properties: {\n    vendor_name: nullable('STRING'),\n    vendor_email: nullable('STRING'),\n    invoice_number: nullable('STRING'),\n    invoice_date: nullable('STRING'),\n    due_date: nullable('STRING'),\n    line_items: {\n      type: 'ARRAY',\n      items: {\n        type: 'OBJECT',\n        properties: {\n          description: { type: 'STRING' },\n          quantity: { type: 'NUMBER' },\n          unit_price: { type: 'NUMBER' },\n          total: { type: 'NUMBER' },\n        },\n        required: ['description', 'quantity', 'unit_price', 'total'],\n      },\n    },\n    subtotal: nullable('NUMBER'),\n    tax_amount: nullable('NUMBER'),\n    total_payable: nullable('NUMBER'),\n    payment_method: nullable('STRING'),\n  },\n  required: ['vendor_name', 'invoice_number', 'line_items', 'total_payable'],\n};\n\n// Dedupe layer 1: workflow static data persists across production runs (not manual test runs).\n// Layer 2 is the \"Check Existing Bill\" lookup against Xero itself.\nconst store = $getWorkflowStaticData('global');\nstore.processed = store.processed || {};\nconst seen = new Set();\n\nconst isPdf = (b) => b.mimeType === 'application/pdf' || /\\.pdf$/i.test(b.fileName || '');\n\nconst items = $input.all();\nconst out = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const j = items[i].json;\n\n  // Gmail items carry an `id`; items from the optional test Form Trigger do not.\n  const isManual = !j.id;\n  const messageId = isManual ? 'manual' : j.id;\n\n  const internalMs = Number(j.internalDate);\n  let received = internalMs ? new Date(internalMs) : new Date(j.date || Date.now());\n  if (isNaN(received.getTime())) received = new Date();\n\n  for (const [prop, bin] of Object.entries(items[i].binary || {})) {\n    if (!isPdf(bin)) continue;\n\n    const attachmentName = bin.fileName || 'invoice.pdf';\n    // One key per attachment so an email with two invoices yields two bills.\n    const dedupeKey = `${messageId}:${attachmentName}`;\n    if (store.processed[dedupeKey] || seen.has(dedupeKey)) continue;\n    seen.add(dedupeKey);\n\n    const buffer = await this.helpers.getBinaryDataBuffer(i, prop);\n\n    out.push({\n      json: {\n        messageId,\n        attachmentName,\n        dedupeKey,\n        subject: j.subject || (isManual ? 'Manual upload' : '(no subject)'),\n        fromAddress: (j.from && j.from.value && j.from.value[0] && j.from.value[0].address) || '',\n        receivedDate: received.toISOString().slice(0, 10),\n        geminiModel: GEMINI_MODEL,\n        geminiBody: {\n          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },\n          contents: [\n            {\n              role: 'user',\n              parts: [\n                { inlineData: { mimeType: bin.mimeType || 'application/pdf', data: buffer.toString('base64') } },\n                { text: 'Extract the invoice data as JSON.' },\n              ],\n            },\n          ],\n          generationConfig: {\n            temperature: 0,\n            responseMimeType: 'application/json',\n            responseSchema: RESPONSE_SCHEMA,\n          },\n        },\n      },\n    });\n  }\n}\n\nreturn out;"
+      }
+    },
+    {
+      "id": "node-03",
+      "name": "Gemini Extract",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $json.geminiModel }}:generateContent",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googlePalmApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.geminiBody) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "credentials": {
+        "googlePalmApi": {
+          "id": "",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "node-04",
+      "name": "Parse & Validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Parse the Gemini response, validate it (plan step 4) and work out fallback dates.\nconst TOLERANCE = 1.0;\nconst ISO_DATE = /^\\d{4}-\\d{2}-\\d{2}$/;\n\nconst toNum = (v) => {\n  if (v === null || v === undefined || v === '') return null;\n  const n = typeof v === 'number' ? v : Number(String(v).replace(/[^0-9.\\-]/g, ''));\n  return Number.isFinite(n) ? n : null;\n};\n\nconst toStr = (v) => {\n  if (v === null || v === undefined) return null;\n  const s = String(v).trim();\n  return s === '' ? null : s;\n};\n\nconst validDate = (v) => {\n  const s = toStr(v);\n  if (!s || !ISO_DATE.test(s)) return null;\n  const d = new Date(`${s}T00:00:00Z`);\n  return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s ? s : null;\n};\n\n// Models occasionally wrap JSON in fences despite instructions: strip them defensively.\nconst parseModelJson = (text) => {\n  const t = String(text).trim().replace(/^```(?:json)?\\s*/i, '').replace(/\\s*```$/, '');\n  try {\n    return JSON.parse(t);\n  } catch (err) {\n    const start = t.indexOf('{');\n    const end = t.lastIndexOf('}');\n    if (start >= 0 && end > start) return JSON.parse(t.slice(start, end + 1));\n    throw err;\n  }\n};\n\nconst items = $input.all();\nconst out = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const resp = items[i].json;\n  const { geminiBody, ...meta } = $('Prepare Invoices').itemMatching(i).json;\n\n  const notes = [];\n  const fallbacks = [];\n  let extracted = null;\n  let rawText = '';\n\n  const candidate = resp.candidates && resp.candidates[0];\n  rawText = ((candidate && candidate.content && candidate.content.parts) || [])\n    .filter((p) => p.text && !p.thought)\n    .map((p) => p.text)\n    .join('');\n\n  if (resp.promptFeedback && resp.promptFeedback.blockReason) {\n    notes.push(`Gemini blocked the request: ${resp.promptFeedback.blockReason}`);\n  }\n  if (candidate && candidate.finishReason && !['STOP', undefined].includes(candidate.finishReason)) {\n    notes.push(`Gemini finishReason was ${candidate.finishReason} (output may be truncated)`);\n  }\n\n  if (!rawText) {\n    notes.push('Gemini returned no text');\n  } else {\n    try {\n      const p = parseModelJson(rawText);\n      extracted = {\n        vendor_name: toStr(p.vendor_name),\n        vendor_email: toStr(p.vendor_email),\n        invoice_number: toStr(p.invoice_number),\n        invoice_date: toStr(p.invoice_date),\n        due_date: toStr(p.due_date),\n        line_items: Array.isArray(p.line_items)\n          ? p.line_items.map((li) => ({\n              description: toStr(li.description),\n              quantity: toNum(li.quantity),\n              unit_price: toNum(li.unit_price),\n              total: toNum(li.total),\n            }))\n          : [],\n        subtotal: toNum(p.subtotal),\n        tax_amount: toNum(p.tax_amount),\n        total_payable: toNum(p.total_payable),\n        payment_method: toStr(p.payment_method),\n      };\n    } catch (err) {\n      notes.push(`AI response was not valid JSON: ${err.message}`);\n    }\n  }\n\n  let billDate = null;\n  let billDueDate = null;\n\n  if (extracted) {\n    if (!extracted.vendor_name) notes.push('vendor_name is missing');\n    if (!extracted.invoice_number) notes.push('invoice_number is missing');\n    if (extracted.total_payable === null) notes.push('total_payable is missing or not a number');\n    if (extracted.line_items.length === 0) {\n      notes.push('line_items is empty');\n    }\n    extracted.line_items.forEach((li, n) => {\n      if (li.quantity === null || li.unit_price === null) {\n        notes.push(`line_items[${n}] (\"${li.description || ''}\") is missing quantity or unit_price`);\n      }\n    });\n\n    const { subtotal, tax_amount, total_payable } = extracted;\n    if (subtotal !== null && tax_amount !== null && total_payable !== null) {\n      const diff = Math.abs(subtotal + tax_amount - total_payable);\n      if (diff > TOLERANCE) {\n        notes.push(\n          `subtotal (${subtotal}) + tax (${tax_amount}) = ${(subtotal + tax_amount).toFixed(2)} ` +\n            `does not match total_payable (${total_payable}); difference ${diff.toFixed(2)}`\n        );\n      }\n    }\n\n    // Fallback dates: invoice date -> email received date; due date -> invoice date (e.g. COD).\n    const invDate = validDate(extracted.invoice_date);\n    if (extracted.invoice_date && !invDate) {\n      fallbacks.push(`invoice_date \"${extracted.invoice_date}\" was not a valid YYYY-MM-DD date`);\n    }\n    billDate = invDate || meta.receivedDate;\n    if (!invDate) {\n      fallbacks.push(`Invoice date not on invoice: used the email received date (${billDate})`);\n    }\n\n    const dueDate = validDate(extracted.due_date);\n    if (extracted.due_date && !dueDate) {\n      fallbacks.push(`due_date \"${extracted.due_date}\" was not a valid YYYY-MM-DD date`);\n    }\n    billDueDate = dueDate || billDate;\n    if (!dueDate) {\n      const cod = /\\b(cod|cash on delivery)\\b/i.test(extracted.payment_method || '');\n      fallbacks.push(\n        `Due date not on invoice: set to the bill date (${billDueDate})${cod ? ' - payment method is COD' : ''}`\n      );\n    }\n  }\n\n  out.push({\n    json: {\n      ...meta,\n      extracted,\n      raw_text: rawText,\n      billDate,\n      billDueDate,\n      fallbacks,\n      valid: notes.length === 0,\n      validation_notes: notes,\n      outcome: notes.length === 0 ? 'valid' : 'invalid',\n    },\n  });\n}\n\nreturn out;"
+      }
+    },
+    {
+      "id": "node-05",
+      "name": "Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-valid",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "node-06",
+      "name": "Xero Connections",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.xero.com/connections",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "xeroOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "xeroOAuth2Api": {
+          "id": "",
+          "name": "Xero OAuth2"
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "node-07",
+      "name": "Resolve Tenant",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Plan step 6: use the first connected Xero organisation (known limitation: no disambiguation).\n// Also prepares the contact search so the HTTP node only has to send it.\nconst connections = $input.all().map((i) => i.json).filter((c) => c && c.tenantId);\nif (connections.length === 0) {\n  throw new Error('Xero /connections returned no organisations for this credential');\n}\nconst tenantId = connections[0].tenantId;\nconst tenantName = connections[0].tenantName || '';\nconst otherOrgs = connections.slice(1).map((c) => c.tenantName || c.tenantId);\n\n// Xero \"where\" strings have no escape mechanism worth relying on: drop quotes/backslashes.\nconst clean = (s) => String(s).replace(/[\"\\\\]/g, '').trim();\n\nreturn $('Parse & Validate')\n  .all()\n  .filter((i) => i.json.valid)\n  .map((i) => {\n    const { vendor_name, vendor_email } = i.json.extracted;\n    // Email match first; the name clause also catches an existing contact with no email on file,\n    // which matters because Xero rejects creating a second contact with the same name.\n    const contactWhere = vendor_email\n      ? `EmailAddress==\"${clean(vendor_email)}\" OR Name.Contains(\"${clean(vendor_name)}\")`\n      : `Name.Contains(\"${clean(vendor_name)}\")`;\n    return { json: { ...i.json, tenantId, tenantName, otherOrgs, contactWhere } };\n  });"
+      }
+    },
+    {
+      "id": "node-08",
+      "name": "Find Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        300
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.xero.com/api.xro/2.0/Contacts",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "xeroOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "xero-tenant-id",
+              "value": "={{ $json.tenantId }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "where",
+              "value": "={{ $json.contactWhere }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "xeroOAuth2Api": {
+          "id": "",
+          "name": "Xero OAuth2"
+        }
+      }
+    },
+    {
+      "id": "node-09",
+      "name": "Pick Contact",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Plan step 7: choose the best existing Contact, or prepare the body to create one.\nconst lc = (s) => String(s || '').trim().toLowerCase();\n\nreturn $input.all().map((it, i) => {\n  const base = $('Resolve Tenant').itemMatching(i).json;\n  const contacts = it.json.Contacts || [];\n  const { vendor_name, vendor_email } = base.extracted;\n\n  let match = null;\n  let contactMatch = null;\n\n  if (vendor_email) {\n    match = contacts.find((c) => lc(c.EmailAddress) === lc(vendor_email));\n    if (match) contactMatch = 'email';\n  }\n  if (!match) {\n    match = contacts.find((c) => lc(c.Name) === lc(vendor_name));\n    if (match) contactMatch = 'name (exact)';\n  }\n  if (!match && contacts.length > 0) {\n    match = contacts[0];\n    contactMatch = 'name (partial)';\n  }\n\n  const newContact = { Name: vendor_name };\n  if (vendor_email) newContact.EmailAddress = vendor_email;\n\n  // Dedupe layer 2 lookup: does this vendor already have a bill with this invoice number?\n  // (A contact we are about to create cannot have one, so that path skips the lookup.)\n  const clean = (s) => String(s).replace(/[\"\\\\]/g, '');\n  const billWhere = match\n    ? `Type==\"ACCPAY\" AND Contact.ContactID==Guid(\"${match.ContactID}\") ` +\n      `AND InvoiceNumber==\"${clean(base.extracted.invoice_number)}\"`\n    : null;\n\n  return {\n    json: {\n      ...base,\n      contactFound: Boolean(match),\n      contactId: match ? match.ContactID : null,\n      contactName: match ? match.Name : vendor_name,\n      contactMatch,\n      billWhere,\n      newContactBody: { Contacts: [newContact] },\n    },\n  };\n});"
+      }
+    },
+    {
+      "id": "node-10",
+      "name": "Contact Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-contactFound",
+              "leftValue": "={{ $json.contactFound }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "node-11",
+      "name": "Check Existing Bill",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        620
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.xero.com/api.xro/2.0/Invoices",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "xeroOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "xero-tenant-id",
+              "value": "={{ $json.tenantId }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "where",
+              "value": "={{ $json.billWhere }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "xeroOAuth2Api": {
+          "id": "",
+          "name": "Xero OAuth2"
+        }
+      }
+    },
+    {
+      "id": "node-12",
+      "name": "Create Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        790
+      ],
+      "parameters": {
+        "method": "PUT",
+        "url": "https://api.xero.com/api.xro/2.0/Contacts",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "xeroOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "xero-tenant-id",
+              "value": "={{ $json.tenantId }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.newContactBody) }}",
+        "options": {}
+      },
+      "credentials": {
+        "xeroOAuth2Api": {
+          "id": "",
+          "name": "Xero OAuth2"
+        }
+      }
+    },
+    {
+      "id": "node-13",
+      "name": "Build Bill",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        620
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Runs after either contact path:\n//  - contact found   -> input is the \"Check Existing Bill\" response ({ Invoices })\n//  - contact created -> input is the \"Create Contact\" response ({ Contacts })\n// Skips the bill if Xero already has it, otherwise builds the payload (plan step 8).\nconst BILL_STATUS = 'DRAFT'; // hard requirement: never AUTHORISED\n\n// Your Xero organisation's purchase tax type code (e.g. \"INPUT\"; codes vary per org and country).\n// When set, each line carries this TaxType plus its share of the invoice's tax_amount so the draft's\n// total matches the invoice. Empty = send no tax info (Xero may then show the pre-tax total).\n// To find the code: open an existing bill with tax in Xero's API Explorer / GET Invoices and read\n// LineItems[].TaxType.\nconst TAX_TYPE = 'INPUT';\n\nconst round2 = (n) => Math.round(n * 100) / 100;\n\n// Split the invoice's tax across lines in proportion to line amounts; the last line absorbs rounding.\nconst allocateTax = (lines, tax) => {\n  const amounts = lines.map((li) => li.quantity * li.unit_price);\n  const base = amounts.reduce((a, b) => a + b, 0);\n  if (!(base > 0)) return null;\n  let allocated = 0;\n  return amounts.map((amt, n) => {\n    const share = n === amounts.length - 1 ? round2(tax - allocated) : round2((tax * amt) / base);\n    allocated += share;\n    return share;\n  });\n};\n\nreturn $input.all().map((it, i) => {\n  const base = $('Pick Contact').itemMatching(i).json;\n  let { contactId, contactName, contactMatch } = base;\n\n  if (it.json.Contacts) {\n    const contact = it.json.Contacts[0];\n    if (!contact || !contact.ContactID) {\n      throw new Error(`Xero did not return a ContactID when creating \"${base.extracted.vendor_name}\"`);\n    }\n    contactId = contact.ContactID;\n    contactName = contact.Name;\n    contactMatch = 'created new contact';\n  } else {\n    const existing = (it.json.Invoices || []).filter(\n      (inv) => !['VOIDED', 'DELETED'].includes(inv.Status)\n    );\n    if (existing.length > 0) {\n      const inv = existing[0];\n      return {\n        json: {\n          ...base,\n          duplicate: true,\n          outcome: 'duplicate',\n          existingBill: { id: inv.InvoiceID, number: inv.InvoiceNumber, status: inv.Status },\n        },\n      };\n    }\n  }\n\n  const { extracted } = base;\n  const tax = extracted.tax_amount;\n  const taxShares = TAX_TYPE && typeof tax === 'number' && tax > 0 ? allocateTax(extracted.line_items, tax) : null;\n\n  const bill = {\n    Type: 'ACCPAY',\n    Contact: { ContactID: contactId },\n    Date: base.billDate,\n    DueDate: base.billDueDate,\n    InvoiceNumber: extracted.invoice_number,\n    Reference: extracted.invoice_number,\n    // No AccountCode, Total or SubTotal: not needed for a draft; Xero computes totals itself.\n    LineItems: extracted.line_items.map((li, n) => ({\n      Description: li.description || 'Invoice line',\n      Quantity: li.quantity,\n      UnitAmount: li.unit_price,\n      ...(taxShares ? { TaxType: TAX_TYPE, TaxAmount: taxShares[n] } : {}),\n    })),\n    ...(taxShares ? { LineAmountTypes: 'Exclusive' } : {}),\n    Status: BILL_STATUS,\n  };\n\n  if (bill.Status !== 'DRAFT' || bill.Type !== 'ACCPAY') {\n    throw new Error('Refusing to build a bill that is not an ACCPAY DRAFT');\n  }\n\n  return {\n    json: {\n      ...base,\n      contactId,\n      contactName,\n      contactMatch,\n      duplicate: false,\n      billBody: { Invoices: [bill] },\n    },\n  };\n});"
+      }
+    },
+    {
+      "id": "node-14",
+      "name": "Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        620
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-duplicate",
+              "leftValue": "={{ $json.duplicate }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "node-15",
+      "name": "Create Bill",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        620
+      ],
+      "parameters": {
+        "method": "PUT",
+        "url": "https://api.xero.com/api.xro/2.0/Invoices",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "xeroOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "xero-tenant-id",
+              "value": "={{ $json.tenantId }}"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.billBody) }}",
+        "options": {}
+      },
+      "credentials": {
+        "xeroOAuth2Api": {
+          "id": "",
+          "name": "Xero OAuth2"
+        }
+      }
+    },
+    {
+      "id": "node-16",
+      "name": "Compose Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        620
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// One composer for every outcome. Inputs (each is a different shape):\n//  - Create Bill response   ({ Invoices })              -> success (also records the dedupe key)\n//  - Duplicate? true        (outcome: 'duplicate')      -> skipped\n//  - Valid? false           (outcome: 'invalid')        -> needs manual review\n//  - On Workflow Error      ({ execution, workflow })   -> failure\nconst esc = (v) =>\n  String(v === null || v === undefined ? '' : v)\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\nconst money = (v) => (typeof v === 'number' ? v.toFixed(2) : '-');\nconst list = (arr) => `<ul>${arr.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`;\nconst pre = (s) =>\n  `<pre style=\"background:#f4f4f4;padding:8px;white-space:pre-wrap\">${esc(s)}</pre>`;\n\nconst source = (j) =>\n  `<p><b>Email:</b> ${esc(j.subject)}<br><b>From:</b> ${esc(j.fromAddress)}<br>` +\n  `<b>Attachment:</b> ${esc(j.attachmentName)}</p>`;\n\nconst lineTable = (lines) =>\n  '<table border=\"1\" cellpadding=\"4\" cellspacing=\"0\" style=\"border-collapse:collapse\">' +\n  '<tr><th>Description</th><th>Qty</th><th>Unit</th><th>Total</th></tr>' +\n  lines\n    .map(\n      (l) =>\n        `<tr><td>${esc(l.description)}</td><td>${esc(l.quantity)}</td>` +\n        `<td>${money(l.unit_price)}</td><td>${money(l.total)}</td></tr>`\n    )\n    .join('') +\n  '</table>';\n\n// Find the Build Bill item that produced this Xero bill. Matching on invoice number + contact\n// (not item position) stays correct when Build Bill ran more than once in a batch.\nconst findBuildBillItem = (inv) => {\n  for (let run = 0; run < 5; run++) {\n    let items;\n    try {\n      items = $('Build Bill').all(0, run);\n    } catch (e) {\n      break;\n    }\n    const hit = items.find((b) => {\n      const sent = b.json.billBody && b.json.billBody.Invoices[0];\n      return sent && sent.InvoiceNumber === inv.InvoiceNumber && sent.Contact.ContactID === (inv.Contact && inv.Contact.ContactID);\n    });\n    if (hit) return hit.json;\n  }\n  return null;\n};\n\nconst store = $getWorkflowStaticData('global');\nstore.processed = store.processed || {};\n\nconst success = (inv) => {\n  const j = findBuildBillItem(inv);\n  if (j) {\n    store.processed[j.dedupeKey] = { xeroInvoiceId: inv.InvoiceID, at: new Date().toISOString() };\n  }\n  // If the context can't be matched the bill still exists; report from Xero's own response.\n  const e = j\n    ? j.extracted\n    : {\n        vendor_name: inv.Contact && inv.Contact.Name,\n        invoice_number: inv.InvoiceNumber,\n        total_payable: null,\n        line_items: (inv.LineItems || []).map((l) => ({\n          description: l.Description,\n          quantity: l.Quantity,\n          unit_price: l.UnitAmount,\n          total: l.LineAmount,\n        })),\n      };\n  const url = `https://go.xero.com/AccountsPayable/View.aspx?InvoiceID=${inv.InvoiceID}`;\n  const mismatch =\n    typeof inv.Total === 'number' && typeof e.total_payable === 'number' && Math.abs(inv.Total - e.total_payable) > 0.01;\n\n  let html = `<h3>Draft bill created</h3>${j ? source(j) : ''}`;\n  if (j) {\n    html +=\n      `<p><b>Vendor:</b> ${esc(e.vendor_name)} (${esc(j.contactMatch)}` +\n      `${j.contactMatch === 'name (partial)' ? ` - matched to existing contact \"${esc(j.contactName)}\", please check it is the right vendor` : ''})<br>`;\n  } else {\n    html += `<p><b>Vendor:</b> ${esc(e.vendor_name)}<br>`;\n  }\n  html +=\n    `<b>Invoice #:</b> ${esc(e.invoice_number)}<br>` +\n    `<b>Bill date:</b> ${esc(j ? j.billDate : inv.DateString)} &nbsp; <b>Due:</b> ${esc(j ? j.billDueDate : inv.DueDateString)}<br>` +\n    `<b>Xero status:</b> ${esc(inv.Status)} &nbsp; <a href=\"${esc(url)}\">Open in Xero</a></p>` +\n    lineTable(e.line_items) +\n    `<p><b>Invoice total:</b> ${money(e.total_payable)} &nbsp; <b>Xero total:</b> ${money(inv.Total)} ` +\n    `(tax in Xero: ${money(inv.TotalTax)})</p>`;\n  if (mismatch) {\n    html +=\n      `<p style=\"color:#b00020\"><b>Xero's total differs from the invoice total.</b> ` +\n      `No tax type is sent unless TAX_TYPE is set in the Build Bill node, so Xero may not have applied ` +\n      `the invoice's tax. Review the draft before approving.</p>`;\n  }\n  if (inv.Status !== 'DRAFT') {\n    html += `<p style=\"color:#b00020\"><b>WARNING: Xero reports status ${esc(inv.Status)}, expected DRAFT.</b></p>`;\n  }\n  if (j && j.fallbacks.length) html += `<p><b>Defaults applied:</b></p>${list(j.fallbacks)}`;\n  if (j && j.otherOrgs && j.otherOrgs.length) {\n    html += `<p><i>Multiple Xero organisations are connected; used \"${esc(j.tenantName)}\" (first). Others: ${esc(j.otherOrgs.join(', '))}</i></p>`;\n  }\n  return { subject: `Draft bill created in Xero: ${e.vendor_name} #${e.invoice_number}`, html };\n};\n\nconst failure = (j) => {\n  const ex = j.execution || {};\n  const err = ex.error || {};\n  return {\n    subject: `Invoice automation FAILED at \"${ex.lastNodeExecuted || 'unknown node'}\"`,\n    html:\n      `<h3>Invoice automation failed</h3>` +\n      `<p><b>Workflow:</b> ${esc(j.workflow && j.workflow.name)}<br>` +\n      `<b>Failed node:</b> ${esc(ex.lastNodeExecuted)}<br>` +\n      `<b>Execution:</b> ${ex.url ? `<a href=\"${esc(ex.url)}\">${esc(ex.id)}</a>` : esc(ex.id)}</p>` +\n      pre(err.message || JSON.stringify(err, null, 2)) +\n      `<p>The invoice was not marked as processed. Fix the cause, then use <b>Retry</b> on that execution ` +\n      `in n8n. Nothing is duplicated: an existing Xero bill is detected before a new one is created.</p>`,\n  };\n};\n\nreturn $input.all().map((item) => {\n  const j = item.json;\n  let msg;\n\n  if (j.execution && j.workflow) {\n    msg = failure(j);\n  } else if (j.Invoices) {\n    msg = success(j.Invoices[0]);\n  } else if (j.outcome === 'duplicate') {\n    msg = {\n      subject: `Skipped: bill already exists in Xero (#${j.extracted.invoice_number})`,\n      html:\n        `<h3>No bill created: duplicate</h3>${source(j)}` +\n        `<p>Xero already has a bill for ${esc(j.extracted.vendor_name)} with invoice number ` +\n        `${esc(j.extracted.invoice_number)} (status ${esc(j.existingBill.status)}).</p>`,\n    };\n  } else {\n    msg = {\n      subject: `Invoice needs manual review: ${j.extracted && j.extracted.vendor_name ? j.extracted.vendor_name : j.subject}`,\n      html:\n        `<h3>Invoice needs manual review</h3>${source(j)}` +\n        `<p>Nothing was created in Xero. Issues found:</p>${list(j.validation_notes)}` +\n        `<p><b>Extracted data:</b></p>${pre(j.extracted ? JSON.stringify(j.extracted, null, 2) : j.raw_text || '(nothing extracted)')}`,\n    };\n  }\n\n  return { json: msg };\n});"
+      }
+    },
+    {
+      "id": "node-17",
+      "name": "Send Notification",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1300,
+        620
+      ],
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "CHANGE_ME@example.com",
+        "subject": "={{ $json.subject }}",
+        "emailType": "html",
+        "message": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "",
+          "name": "Gmail OAuth2"
+        }
+      }
+    },
+    {
+      "id": "node-18",
+      "name": "On Workflow Error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        1040,
+        790
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Prepare Invoices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Invoices": {
+      "main": [
+        [
+          {
+            "node": "Gemini Extract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Extract": {
+      "main": [
+        [
+          {
+            "node": "Parse & Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Validate": {
+      "main": [
+        [
+          {
+            "node": "Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid?": {
+      "main": [
+        [
+          {
+            "node": "Xero Connections",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Compose Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Xero Connections": {
+      "main": [
+        [
+          {
+            "node": "Resolve Tenant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Tenant": {
+      "main": [
+        [
+          {
+            "node": "Find Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Contact": {
+      "main": [
+        [
+          {
+            "node": "Pick Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Contact": {
+      "main": [
+        [
+          {
+            "node": "Contact Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contact Found?": {
+      "main": [
+        [
+          {
+            "node": "Check Existing Bill",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Existing Bill": {
+      "main": [
+        [
+          {
+            "node": "Build Bill",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Contact": {
+      "main": [
+        [
+          {
+            "node": "Build Bill",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Bill": {
+      "main": [
+        [
+          {
+            "node": "Duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Duplicate?": {
+      "main": [
+        [
+          {
+            "node": "Compose Notification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Bill",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Bill": {
+      "main": [
+        [
+          {
+            "node": "Compose Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Notification": {
+      "main": [
+        [
+          {
+            "node": "Send Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "On Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Compose Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "gmailXeroBills"
+  },
+  "active": false,
+  "pinData": {}
+}
