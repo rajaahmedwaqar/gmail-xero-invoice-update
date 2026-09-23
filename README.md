@@ -9,8 +9,8 @@ n8n • Gmail API • Xero API • Google Gemini (AI extraction)
 Xero Draft Bills
 
 The workflow creates vendor bills in Xero as Draft records, allowing them to be reviewed before approval.
-1790185254514_image.png
-1790185291034_image.png 
+(1790185254514_image.png)
+(1790185291034_image.png)
 
 
 ![n8n](https://img.shields.io/badge/n8n-Workflow_Automation-EA4B71?logo=n8n&logoColor=white)
