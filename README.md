@@ -5,6 +5,7 @@ An **n8n workflow that turns vendor invoice emails into ready-to-review draft Bi
 When a vendor emails an invoice, this workflow reads the PDF (any layout, any vendor, even scanned/image-only PDFs with no text layer), pulls out the vendor, line items, dates, and totals, matches or creates the vendor as a Xero Contact, and creates a **Draft Bill** — never auto-approved — ready for a human to check in seconds instead of typing it in from scratch.
 
 n8n • Gmail API • Xero API • Google Gemini (AI extraction)
+<img width="856" height="548" alt="image" src="https://github.com/user-attachments/assets/4b2bed35-dbeb-4862-9a7c-8d5265b1da27" />
 
 ![n8n](https://img.shields.io/badge/n8n-Workflow_Automation-EA4B71?logo=n8n&logoColor=white)
 ![Gmail](https://img.shields.io/badge/Gmail-Trigger_%26_Notifications-EA4335?logo=gmail&logoColor=white)
