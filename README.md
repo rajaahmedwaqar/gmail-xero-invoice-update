@@ -6,12 +6,24 @@ When a vendor emails an invoice, this workflow reads the PDF (any layout, any ve
 
 n8n • Gmail API • Xero API • Google Gemini (AI extraction)
 
-Xero Draft Bills
+### n8n Workflow
 
-The workflow creates vendor bills in Xero as Draft records, allowing them to be reviewed before approval.
-(1790185254514_image.png)
-(1790185291034_image.png)
+![Gmail to Xero invoice automation workflow in n8n, including AI extraction, validation, duplicate checking, and draft bill creation](1790185192132_image.png)
 
+### Xero Draft Bills
+
+The workflow creates vendor bills in Xero as **Draft** records, allowing them to be reviewed before approval.
+
+![First draft vendor bill created automatically in Xero](1790185254514_image.png)
+
+### Gmail Notifications
+
+![First Gmail notification confirming a draft bill was created in Xero](1790185325119_image.png)
+
+
+### Duplicate Prevention
+
+![Gmail notification showing that a duplicate invoice was detected and skipped](1790185399707_image.png)
 
 ![n8n](https://img.shields.io/badge/n8n-Workflow_Automation-EA4B71?logo=n8n&logoColor=white)
 ![Gmail](https://img.shields.io/badge/Gmail-Trigger_%26_Notifications-EA4335?logo=gmail&logoColor=white)
