@@ -8,7 +8,7 @@ n8n • Gmail API • Xero API • Google Gemini (AI extraction)
 
 ### n8n Workflow
 
-![Gmail to Xero invoice automation workflow in n8n, including AI extraction, validation, duplicate checking, and draft bill creation](xero final_image.png)
+![Gmail to Xero invoice automation workflow in n8n, including AI extraction, validation, duplicate checking, and draft bill creation](xero-final_image.png)
 
 ### Xero Draft Bills
 
