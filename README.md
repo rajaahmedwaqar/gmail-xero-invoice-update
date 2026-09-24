@@ -6,6 +6,12 @@ When a vendor emails an invoice, this workflow reads the PDF (any layout, any ve
 
 n8n • Gmail API • Xero API • Google Gemini (AI extraction)
 
+![n8n](https://img.shields.io/badge/n8n-Automation-EA4B71?logo=n8n&logoColor=white)
+![Gmail](https://img.shields.io/badge/Gmail-Notifications-EA4335?logo=gmail&logoColor=white)
+![Xero](https://img.shields.io/badge/Xero-Invoice%20Automation-13B5EA?logo=xero&logoColor=white)
+![Gemini](https://img.shields.io/badge/Google%20Gemini-AI%20Extraction-4285F4?logo=googlegemini&logoColor=white)
+
+
 ### n8n Workflow
 
 ![Gmail to Xero invoice automation workflow in n8n, including AI extraction, validation, duplicate checking, and draft bill creation](n8n-workflow.png)
