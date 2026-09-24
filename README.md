@@ -24,7 +24,7 @@ The workflow creates vendor bills in Xero as **Draft** records, allowing them to
 
 ### Gmail Notifications
 
-![First Gmail notification confirming a draft bill was created in Xero](duplicate-mail.png)
+![First Gmail notification confirming a draft bill was created in Xero](draft-created-mail.png)
 
 
 ### Duplicate Prevention
