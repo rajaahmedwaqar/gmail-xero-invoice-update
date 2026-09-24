@@ -23,7 +23,7 @@ The workflow creates vendor bills in Xero as **Draft** records, allowing them to
 
 ### Duplicate Prevention
 
-![Gmail notification showing that a duplicate invoice was detected and skipped](1790185399707_image.png)
+![Gmail notification showing that a duplicate invoice was detected and skipped](duplicate-bill.png)
 
 ![n8n](https://img.shields.io/badge/n8n-Workflow_Automation-EA4B71?logo=n8n&logoColor=white)
 ![Gmail](https://img.shields.io/badge/Gmail-Trigger_%26_Notifications-EA4335?logo=gmail&logoColor=white)
